@@ -1,0 +1,9 @@
+streamlit==1.56.0
+numpy
+pandas
+opencv-python-headless
+Pillow
+pytesseract
+supabase
+google-genai
+pydantic>=2
