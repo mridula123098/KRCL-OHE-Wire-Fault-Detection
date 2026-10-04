@@ -148,7 +148,7 @@ def detect_ohe_mask(image_path):
             "mime_type": "application/json",
             "schema": SegmentationResponse.model_json_schema(),
         },
-        generation_config={"thinking_level": "minimal"},
+        generation_config={"thinking_level": "low"},
         store=False,
     )
 
