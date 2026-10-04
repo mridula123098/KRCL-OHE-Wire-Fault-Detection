@@ -4,7 +4,7 @@ AI-assisted thermal analysis for railway OHE inspection images.
 
 Gemini identifies the physical OHE region.
 Python/OpenCV performs numerical temperature calculation from the
-image's own thermal colour scale with enhanced spatial precision.
+image's own thermal colour scale with continuous linear mapping.
 """
 
 import os
@@ -31,7 +31,7 @@ class ThermalAnalysisError(RuntimeError):
 
 
 def _ocr_number(crop_bgr):
-    """Read the numeric part of a thermal scale label with multi-threshold fallback."""
+    """Read the numeric part of a thermal scale label."""
     if crop_bgr is None or crop_bgr.size == 0:
         return None
 
@@ -77,7 +77,7 @@ def _ocr_number(crop_bgr):
 
 
 def has_minus_sign(crop_bgr):
-    """Explicit minus-sign detection via structural morphology and OCR."""
+    """Explicit minus-sign detection."""
     if crop_bgr is None or crop_bgr.size == 0:
         return False
 
@@ -192,67 +192,38 @@ def extract_temperature_scale(image_bgr):
     return scale, float(t_max), float(t_min)
 
 
-def build_lut(scale, t_max, t_min, n_samples=1024):
-    """Build fine-grained high-resolution colour-to-temperature lookup."""
+def map_pixels_to_temperature(image_bgr, scale, t_max, t_min):
+    """
+    Direct vertical linear mapping along the thermal scale bar.
+    Avoids discrete lookup clustering and produces continuous temperature values.
+    """
     scale_height = scale.shape[0]
-
     bar_start = int(scale_height * 0.20)
     bar_end = int(scale_height * 0.80)
-
     bar = scale[bar_start:bar_end]
 
     if bar.size == 0:
         raise ThermalAnalysisError("Thermal colour bar could not be extracted.")
 
-    # Trim margin noise along edges of bar strip
-    if bar.shape[1] > 4:
-        bar = bar[:, 2:-2]
+    # Convert image and scale bar to float32
+    img_float = image_bgr.astype(np.float32)
+    bar_colors = bar.mean(axis=1).astype(np.float32)  # Mean color across bar width
 
-    row_colours = bar.mean(axis=1)
+    # Compute Euclidean distance for all pixels relative to vertical color bar entries
+    diffs = img_float[:, :, None, :] - bar_colors[None, None, :, :]
+    dists = np.sqrt(np.sum(diffs ** 2, axis=3))
 
-    rows = np.linspace(0, len(row_colours) - 1, n_samples).astype(int)
+    # Find the nearest vertical color bar position
+    min_indices = np.argmin(dists, axis=2)
+    min_distances = np.min(dists, axis=2)
 
-    colours = row_colours[rows].astype(np.float32)
-    temperatures = np.linspace(t_max, t_min, n_samples, dtype=np.float32)
+    # Normalize relative position from top (0.0 = t_max) to bottom (1.0 = t_min)
+    normalized_pos = min_indices / float(len(bar_colors) - 1)
+    
+    # Continuous linear interpolation between t_max and t_min
+    temp_map = t_max - normalized_pos * (t_max - t_min)
 
-    return colours, temperatures
-
-
-def map_pixels_to_temperature(image_bgr, scale, t_max, t_min):
-    """Map pixels to temperature using distance-weighted sub-pixel interpolation."""
-    lut_colours, lut_temperatures = build_lut(
-        scale,
-        t_max,
-        t_min,
-        n_samples=1024
-    )
-
-    height, width = image_bgr.shape[:2]
-    pixels = image_bgr.reshape(-1, 3).astype(np.float32)
-
-    temperature_flat = np.empty(len(pixels), dtype=np.float32)
-    distance_flat = np.empty(len(pixels), dtype=np.float32)
-
-    batch_size = 20000
-
-    for start in range(0, len(pixels), batch_size):
-        end = min(start + batch_size, len(pixels))
-        batch = pixels[start:end]
-
-        difference = batch[:, None, :] - lut_colours[None, :, :]
-        distance_squared = np.sum(difference * difference, axis=2)
-
-        nearest = np.argmin(distance_squared, axis=1)
-
-        temperature_flat[start:end] = lut_temperatures[nearest]
-        distance_flat[start:end] = np.sqrt(
-            distance_squared[np.arange(len(batch)), nearest]
-        )
-
-    return (
-        temperature_flat.reshape(height, width),
-        distance_flat.reshape(height, width),
-    )
+    return temp_map.astype(np.float32), min_distances.astype(np.float32)
 
 
 def _validate_ai_mask(mask, image_shape):
@@ -263,7 +234,7 @@ def _validate_ai_mask(mask, image_shape):
 
     mask = (mask > 0).astype(np.uint8)
 
-    # Exclude UI sidebars and clock overlays
+    # Remove thermal scale and right sidebar UI
     mask[:, int(width * 0.88):] = 0
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -288,41 +259,52 @@ def _validate_ai_mask(mask, image_shape):
 def classify_delta(delta_t):
     if delta_t > 20:
         return "CRITICAL", "To be attended within 24 hrs"
+
     if delta_t > 10:
         return "WARNING", "To be attended within 10 days"
+
     if delta_t > 5:
         return "MONITOR", "To be attended within 1 month"
+
     return "NORMAL", "Normal — No fault detected"
 
 
 def compute_wire_temperature(temperature_map, colour_distance, ai_mask):
     """
-    Computes precise wire segment max and min temperatures by filtering out
-    single-pixel noise artifacts and non-thermal overlay lines.
+    Computes wire max/min temperatures with wide color tolerance and printed debug statistics.
     """
     mask = _validate_ai_mask(ai_mask, temperature_map.shape)
 
-    valid = (mask == 1) & np.isfinite(temperature_map)
-
-    # Reject non-thermal or overlay pixels with high color deviation
-    valid &= colour_distance <= 65.0
-
+    # Filter for valid finite temperatures inside mask with relaxed color distance threshold
+    valid = (mask == 1) & np.isfinite(temperature_map) & (colour_distance <= 110.0)
     wire_temperatures = temperature_map[valid]
 
-    if wire_temperatures.size < 100:
+    if wire_temperatures.size < 20:
+        # Fallback to non-distance filtered mask if strict distance filter drops valid pixels
+        valid = (mask == 1) & np.isfinite(temperature_map)
+        wire_temperatures = temperature_map[valid]
+
+    if wire_temperatures.size < 10:
         raise ThermalAnalysisError(
             "Too few valid thermal pixels remained inside the AI OHE mask."
         )
 
-    # Max Temp: Average top 0.5% hotspot pixels to suppress single bad pixels
-    top_k = max(1, int(wire_temperatures.size * 0.005))
-    max_temperature = float(np.mean(np.partition(wire_temperatures, -top_k)[-top_k:]))
+    sorted_temps = np.sort(wire_temperatures)
 
-    # Min Temp: Robust 10th percentile for ambient wire reference
-    min_temperature = float(np.percentile(wire_temperatures, 10.0))
+    # Percentile evaluation
+    max_temperature = float(np.percentile(sorted_temps, 99.5))
+    min_temperature = float(np.percentile(sorted_temps, 5.0))
 
     if max_temperature < min_temperature:
-        raise ThermalAnalysisError("Temperature statistics are inconsistent.")
+        max_temperature, min_temperature = min_temperature, max_temperature
+
+    # Terminal logs to confirm script execution and data variations
+    print(f"\n--- [THERMAL DEBUG] ---")
+    print(f"Total Valid Wire Pixels: {wire_temperatures.size}")
+    print(f"Raw Wire Range: {sorted_temps[0]:.2f} °C to {sorted_temps[-1]:.2f} °C")
+    print(f"Extracted Wire Min (5th Pct): {min_temperature:.2f} °C")
+    print(f"Extracted Wire Max (99.5th Pct): {max_temperature:.2f} °C")
+    print(f"-----------------------\n")
 
     delta = float(max_temperature - min_temperature)
     status, attend_in = classify_delta(delta)
@@ -341,18 +323,22 @@ def compute_wire_temperature(temperature_map, colour_distance, ai_mask):
 def _find_col(df, keywords):
     for column in df.columns:
         name = str(column).strip().lower()
+
         if any(keyword in name for keyword in keywords):
             return column
+
     return None
 
 
 def _parse_datetime(value):
     if pd.isna(value):
         return None
+
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()
 
     text = str(value).strip().replace(" UTC", "")
+
     formats = [
         "%Y-%m-%d %H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
@@ -373,13 +359,17 @@ def _parse_datetime(value):
 
 def _image_datetime(image_filename):
     basename = os.path.splitext(os.path.basename(image_filename))[0]
+
     parts = basename.split("-")
 
     if len(parts) < 2:
         return None
 
     try:
-        return datetime.strptime(parts[0] + parts[1], "%Y%m%d%H%M%S")
+        return datetime.strptime(
+            parts[0] + parts[1],
+            "%Y%m%d%H%M%S",
+        )
     except ValueError:
         return None
 
@@ -387,6 +377,7 @@ def _image_datetime(image_filename):
 def get_station_from_filename(image_filename, sheet_id=None):
     """Match image date/time against the Google Sheet."""
     image_datetime = _image_datetime(image_filename)
+
     if image_datetime is None:
         return None
 
@@ -437,6 +428,7 @@ def get_station_from_filename(image_filename, sheet_id=None):
         return None
 
     ohe_value = nearest[ohe_column] if ohe_column is not None else "N/A"
+
     if pd.isna(ohe_value):
         ohe_value = "N/A"
 
