@@ -6,7 +6,7 @@ components. It does NOT calculate temperatures.
 
 import os
 from typing import List
-
+import streamlit as st
 import cv2
 import numpy as np
 from google import genai
@@ -68,7 +68,7 @@ components/junctions. Use the exact JSON schema provided.
 
 
 def _get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = st.secrets["GEMINI_API_KEY"]
     if not api_key:
         raise RuntimeError(
             "GEMINI_API_KEY is not configured. Add it to Streamlit secrets."
